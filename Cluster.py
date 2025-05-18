@@ -82,12 +82,15 @@ def macroF1(y_pred, y_true):
         f1_scores.append(f1)
     return np.mean(f1_scores)
 
-pcs = PCA_from_Scratch(train_flat, 128)
-train_proj = transform(train_flat, pcs)
-test_proj = transform(test_flat, pcs)
+print("1Starting...")
+
 train_normal = train_flat/255
 test_normal = test_flat/255
-
+pcs = PCA_from_Scratch(train_normal, 128)
+train_proj = transform(train_normal, pcs)
+test_proj = transform(test_normal, pcs)
+train_binary = (train_normal > 0.3).astype(int)
+test_binary = (test_normal > 0.3).astype(int)
 
 class KMeansClustering:
     def __init__(self, k, max_iter=1000,distance_metric='euclidean'):
@@ -124,12 +127,16 @@ class KMeansClustering:
         self.n_samples, self.n_features = X.shape
         self.centroids = X[np.random.choice(self.n_samples, self.k, replace=False)]
         self.labels = np.zeros(self.n_samples)
-        
+        new_centroids = np.zeros((self.k, self.n_features))
         for _ in range(self.max_iter):
             distances = np.array([[self._distance(x, c) for c in self.centroids] for x in X])
             self.labels = np.argmin(distances, axis=1)
-            new_centroids = np.array([X[self.labels == i].mean(axis=0) for i in range(self.k)])
-            
+            for i in range(self.k):
+                members = X[self.labels == i]
+                if len(members) == 0:
+                    new_centroids[i] = X[np.random.randint(self.n_samples)]
+                else:
+                    new_centroids[i] = members.mean(axis=0)            
             if np.all(new_centroids == self.centroids):
                 break
             
@@ -137,25 +144,188 @@ class KMeansClustering:
         
         return self
     
+import numpy as np
 
-print("Starting...")
-km = KMeansClustering(k=5, max_iter=1000, distance_metric='euclidean')
+class KMeansPP:
+    def __init__(self, k, max_iter=1000, distance_metric='euclidean', tol=1e-6):
+        self.k = k
+        self.max_iter = max_iter
+        self.distance_metric = distance_metric
+        self.tol = tol
+    
+    def euclidean_distance(self, a, b):
+        return np.linalg.norm(a - b)
+
+    def manhattan_distance(self, a, b):
+        return np.sum(np.abs(a - b))
+
+    def cosine_distance(self, a, b):
+        denom = np.linalg.norm(a) * np.linalg.norm(b)
+        return 1 - np.dot(a, b) / denom if denom != 0 else 1.0
+
+    def _distance(self, a, b):
+        if self.distance_metric == 'euclidean':
+            return self.euclidean_distance(a, b)
+        elif self.distance_metric == 'manhattan':
+            return self.manhattan_distance(a, b)
+        elif self.distance_metric == 'cosine':
+            return self.cosine_distance(a, b)
+        else:
+            raise ValueError(f"Unknown metric {self.distance_metric}")
+
+    def _init_centroids_pp(self, X):
+        """k-means++ initialization"""
+        n_samples, _ = X.shape
+        centroids = []
+        # 1) choose first centroid uniformly at random
+        first_idx = np.random.randint(n_samples)
+        centroids.append(X[first_idx])
+
+        # 2) choose remaining k-1 centroids
+        for _ in range(1, self.k):
+            # compute squared distances to nearest existing centroid
+            dist_sq = np.array([
+                min(self._distance(x, c)**2 for c in centroids)
+                for x in X
+            ])
+            # pick next centroid weighted by dist_sq
+            probs = dist_sq / dist_sq.sum()
+            cumulative = np.cumsum(probs)
+            r = np.random.rand()
+            next_idx = np.searchsorted(cumulative, r)
+            centroids.append(X[next_idx])
+        
+        return np.vstack(centroids)
+
+    def fit(self, X):
+        self.X = X
+        n_samples, n_features = X.shape
+
+        # initialize centroids with kmeans++
+        self.centroids = self._init_centroids_pp(X)
+        self.labels = np.zeros(n_samples, dtype=int)
+
+        for it in range(self.max_iter):
+            # 1) assign labels
+            distances = np.array([
+                [self._distance(x, c) for c in self.centroids]
+                for x in X
+            ])  # shape (n_samples, k)
+            new_labels = np.argmin(distances, axis=1)
+
+            # 2) compute new centroids
+            new_centroids = np.zeros_like(self.centroids)
+            for ci in range(self.k):
+                members = X[new_labels == ci]
+                if len(members) == 0:
+                    # re-seed empty cluster
+                    new_centroids[ci] = X[np.random.randint(n_samples)]
+                else:
+                    new_centroids[ci] = members.mean(axis=0)
+
+            # 3) check convergence
+            if np.linalg.norm(new_centroids - self.centroids) < self.tol:
+                break
+
+            self.centroids = new_centroids
+            self.labels = new_labels
+
+        return self
+
+    def predict(self, X):
+        distances = np.array([
+            [self._distance(x, c) for c in self.centroids]
+            for x in X
+        ])
+        return np.argmin(distances, axis=1)
+def calinski_harabasz_score(X, labels):
+    n_samples, n_features = X.shape
+    unique_labels = np.unique(labels)
+    k = len(unique_labels)
+    
+    overall_mean = np.mean(X, axis=0)
+    between_cluster_dispersion = 0
+    within_cluster_dispersion = 0
+
+    for label in unique_labels:
+        cluster_points = X[labels == label]
+        cluster_mean = np.mean(cluster_points, axis=0)
+        between_cluster_dispersion += len(cluster_points) * np.sum((cluster_mean - overall_mean)**2)
+        within_cluster_dispersion += np.sum((cluster_points - cluster_mean)**2)
+
+    return (between_cluster_dispersion * (n_samples - k)) / (within_cluster_dispersion * (k - 1))
+
+def davies_bouldin_score(X, labels):
+    unique_labels = np.unique(labels)
+    k = len(unique_labels)
+    cluster_means = np.array([np.mean(X[labels == label], axis=0) for label in unique_labels])
+    cluster_sigs = np.array([np.mean(np.linalg.norm(X[labels == label] - cluster_means[i], axis=1)) for i, label in enumerate(unique_labels)])
+
+    db_index = 0
+    for i in range(k):
+        max_ratio = -np.inf
+        for j in range(k):
+            if i != j:
+                ratio = (cluster_sigs[i] + cluster_sigs[j]) / np.linalg.norm(cluster_means[i] - cluster_means[j])
+                if ratio > max_ratio:
+                    max_ratio = ratio
+        db_index += max_ratio
+
+    return db_index / k
+
+distance = ['manhattan', 'euclidean', 'cosine']
+dataset = [train_normal, train_normal]
+testset = [test_normal, test_proj]
+PCA = [32, 64, 128, 256]
+# dataset = [ train_binary]
+# testset = [ test_binary]
+
+print("Distance Metric: Cosine")
+print("PCA: ", train_normal)
+# pcs = PCA_from_Scratch(train_normal, i)
+# train_normal = transform(train_normal, pcs)
+# test_proj = transform(test_normal, pcs)
+
+km = KMeansClustering(k=5, max_iter=1000, distance_metric='cosine')
+kmp = KMeansPP(k=5, max_iter=1000, distance_metric='cosine')
 km.fit(train_normal)
-train_clusters = km.labels   
+kmp.fit(train_normal)
 
-mapping = {}
-for c in range(km.k):
-    mask = (train_clusters == c)
-    if not np.any(mask):
-        mapping[c] = -1
-    else:
-        lbls, counts = np.unique(train_labels[mask], return_counts=True)
-        mapping[c] = lbls[np.argmax(counts)]
+# SSE calculation
+train_sse = np.sum([np.linalg.norm(x - km.centroids[km.labels[i]])**2 for i, x in enumerate(train_normal)])
+train_sse2 = np.sum([np.linalg.norm(x - kmp.centroids[kmp.labels[i]])**2 for i, x in enumerate(train_normal)])
+print("SSE KMeans: ", train_sse)
+print("SSE KMeans++: ", train_sse2)
 
+# Additional internal metrics
+ch_score = calinski_harabasz_score(train_normal, km.labels)
+ch_score2 = calinski_harabasz_score(train_normal, kmp.labels)
+print("Calinski-Harabasz KMeans: ", ch_score)
+print("Calinski-Harabasz KMeans++: ", ch_score2)
+
+db_score = davies_bouldin_score(train_normal, km.labels)
+db_score2 = davies_bouldin_score(train_normal, kmp.labels)
+print("Davies-Bouldin KMeans: ", db_score)
+print("Davies-Bouldin KMeans++: ", db_score2)
+
+# Label mappings
+mapping, mapping2 = {}, {}
+for c in range(5):
+    mask, mask2 = (km.labels == c), (kmp.labels == c)
+    mapping[c] = np.bincount(train_labels[mask].flatten()).argmax() if np.any(mask) else -1
+    mapping2[c] = np.bincount(train_labels[mask2].flatten()).argmax() if np.any(mask2) else -1
+
+# External metrics
 test_clusters = km.predict(test_normal)
-y_pred = np.array([ mapping[c] for c in test_clusters ])
+test_clusters2 = kmp.predict(test_normal)
 
-print("KMeans Accuracy:     ", score(y_pred, test_labels))
-print("KMeans Macro F1:     ", macroF1(y_pred, test_labels))
+y_pred = np.array([mapping[c] for c in test_clusters])
+y_pred2 = np.array([mapping2[c] for c in test_clusters2])
 
-print(y_pred)
+accuracy_km = score(y_pred.reshape(-1,1), test_labels)
+accuracy_kmp = score(y_pred2.reshape(-1,1), test_labels)
+
+print("KMeans Accuracy:     ", accuracy_km)
+print("KMeans++ Accuracy:   ", accuracy_kmp)
+print("KMeans Macro F1:     ", macroF1(y_pred.reshape(-1,1), test_labels))
+print("KMeans++ Macro F1:   ", macroF1(y_pred2.reshape(-1,1), test_labels))
